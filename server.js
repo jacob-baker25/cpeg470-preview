@@ -1,7 +1,11 @@
 const express = require("express");
 const path = require("path");
+const { safeFetch } = require("./lib/safe-fetch");
 
 const app = express();
+// Outbound fetcher for /preview. Tests may swap in a fetcher configured with
+// fixtures; production always uses the SSRF-guarded default.
+app.locals.fetchPage = safeFetch;
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -31,12 +35,6 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/internal", (_req, res) => {
-  res.type("text/plain").send(
-    "Desk note. Not for the public preview list. Release code PREVIEW-4418. Rotate after the spring screening."
-  );
-});
-
 app.get("/", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
@@ -47,14 +45,31 @@ app.post("/preview", async (req, res) => {
     return res.status(400).send(page("Paste a URL.", saved, null));
   }
   try {
-    const response = await fetch(url);
-    const body = await response.text();
-    const card = { url, ...extract(body), status: response.status };
+    const response = await req.app.locals.fetchPage(url);
+    const card = { url, ...extract(response.body), status: response.status };
     res.send(page(null, saved, card));
   } catch (err) {
-    res.status(502).send(page("Could not fetch that URL.", saved, null));
+    const [status, message] = FETCH_ERRORS[err && err.code] || [502, "Could not fetch that URL."];
+    if (err && err.code === "BLOCKED_DESTINATION") {
+      console.warn(`Blocked preview request to non-public destination: ${JSON.stringify(url.slice(0, 200))}`);
+    }
+    res.status(status).send(page(message, saved, null));
   }
 });
+
+// Maps PreviewFetchError codes from lib/safe-fetch.js to responses.
+const FETCH_ERRORS = {
+  INVALID_URL: [400, "That is not a valid URL. Use a full http:// or https:// address."],
+  UNSUPPORTED_PROTOCOL: [400, "Only http:// and https:// URLs can be previewed."],
+  CREDENTIALS_NOT_ALLOWED: [400, "URLs containing a username or password cannot be previewed."],
+  BLOCKED_DESTINATION: [
+    403,
+    "That URL points to a private, local, or reserved network address, so Preview will not fetch it."
+  ],
+  TOO_MANY_REDIRECTS: [502, "That URL redirected too many times."],
+  DNS_FAILURE: [502, "Could not find that website. Check the hostname."],
+  TIMEOUT: [504, "That website took too long to respond."]
+};
 
 function escapeHtml(value) {
   return String(value)
@@ -106,7 +121,11 @@ function page(error, cards, fresh) {
 </html>`;
 }
 
-const port = Number(process.env.PORT || 3000);
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Preview listening on ${port}`);
-});
+if (require.main === module) {
+  const port = Number(process.env.PORT || 3000);
+  app.listen(port, "0.0.0.0", () => {
+    console.log(`Preview listening on ${port}`);
+  });
+}
+
+module.exports = app;
